@@ -145,3 +145,116 @@ class TestDateTruncWeek:
         assert isinstance(result, Ok)
         row = con.execute(result.value).fetchone()
         assert row == (_dt.date(2024, 5, 12),)
+
+
+class TestDateTruncOverTableColumn:
+    """Regression: ``DATE_TRUNC(date_col, …)`` over a real table column.
+
+    The tests above only exercise ``DATE_TRUNC`` over a ``DATE '…'``
+    literal. That hid two compounding bugs that only surface once the
+    operand is a schema-typed table column instead of a literal:
+
+    1. :func:`bqemulator.sql.rules.iso_date_parts._is_date_typed`
+       recognised only literal ``CAST(... AS DATE)`` / ``CURRENT_DATE()``
+       operands — never a column resolved DATE-typed via
+       ``annotate_types`` (the ``schema=`` translate() argument).
+    2. Every rule in this module matched only ``isinstance(node,
+       exp.DateTrunc)``. That is the shape SQLGlot's *single-shot*
+       ``sqlglot.transpile(read="bigquery", write="duckdb")`` keeps end
+       to end, but :meth:`SQLTranslator._apply_rules` re-parses the
+       *already-transpiled* DuckDB SQL text
+       (``sqlglot.parse_one(sql, read="duckdb")``) before applying these
+       rules — and SQLGlot's DuckDB parser turns ``DATE_TRUNC(unit,
+       date)`` into ``exp.TimestampTrunc``, not ``exp.DateTrunc``, for
+       every unit. So whenever a rule needed to act as the safety net at
+       that re-parse stage (see the multi-CTE regression below), it
+       silently never matched and the call fell straight through to
+       DuckDB's un-adjusted default.
+
+    Both bugs needed fixing together: (1) alone still leaves the
+    isinstance check unreachable at the re-parse stage; (2) alone still
+    leaves ``_is_date_typed`` blind to column operands, so the rule
+    matches the node but declines to rewrite it.
+    """
+
+    def test_week_over_column_matches_literal(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        con.execute('CREATE SCHEMA "test-project__bqemu"')
+        con.execute('CREATE TABLE "test-project__bqemu"."placements" (placed_on DATE)')
+        con.execute(
+            'INSERT INTO "test-project__bqemu"."placements" VALUES '
+            "('2024-05-15'), ('2024-05-12'), ('2024-05-18')",  # Wed / Sun / Sat
+        )
+        schema = {"placements": {"placed_on": "DATE"}}
+        result = t.translate(
+            "SELECT DATE_TRUNC(placed_on, WEEK) AS d "
+            "FROM `test-project.bqemu.placements` ORDER BY placed_on",
+            schema=schema,
+        )
+        assert isinstance(result, Ok)
+        duckdb_sql = result.value.replace(
+            '"test-project"."bqemu"."placements"',
+            '"test-project__bqemu"."placements"',
+        )
+        rows = con.execute(duckdb_sql).fetchall()
+        # All three inputs fall in the same Sunday-start week: 2024-05-12.
+        assert rows == [(_dt.date(2024, 5, 12),)] * 3
+        desc = con.execute(duckdb_sql).description
+        assert desc[0][1] == "DATE"
+
+    def test_isoyear_over_column_casts_to_date(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        con.execute('CREATE SCHEMA "test-project__bqemu"')
+        con.execute('CREATE TABLE "test-project__bqemu"."placements" (placed_on DATE)')
+        con.execute('INSERT INTO "test-project__bqemu"."placements" VALUES (\'2024-01-02\')')
+        schema = {"placements": {"placed_on": "DATE"}}
+        result = t.translate(
+            "SELECT DATE_TRUNC(placed_on, ISOYEAR) AS d FROM `test-project.bqemu.placements`",
+            schema=schema,
+        )
+        assert isinstance(result, Ok)
+        duckdb_sql = result.value.replace(
+            '"test-project"."bqemu"."placements"',
+            '"test-project__bqemu"."placements"',
+        )
+        desc = con.execute(duckdb_sql).description
+        assert desc[0][1] == "DATE"
+        row = con.execute(duckdb_sql).fetchone()
+        assert row == (_dt.date(2024, 1, 1),)
+
+    def test_week_over_column_survives_unrelated_date_add_in_same_query(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        """Regression for the multi-CTE production query that surfaced this.
+
+        ``rewrite_datetime_helpers`` (the ``DATE_ADD``/``DATE_SUB`` /
+        ``DATE_FROM_UNIX_DATE`` pre-translator) re-parses the *entire*
+        BigQuery SQL text and re-serialises it back to BigQuery dialect
+        whenever the query contains any of those calls — even ones
+        unrelated to the ``DATE_TRUNC`` this test cares about. That
+        parse → re-emit round trip drops the ``WEEK(SUNDAY)`` day
+        qualifier down to bare ``WEEK`` (a SQLGlot BigQuery-generator
+        gap, tracked separately). This test locks in that the *result*
+        is still correct even though the qualifier gets lost along the
+        way — the DateTruncWeekRule safety net for bare ``WEEK`` must
+        still catch it once the operand is a real DATE column.
+        """
+        con.execute('CREATE SCHEMA "test-project__bqemu"')
+        con.execute('CREATE TABLE "test-project__bqemu"."placements" (placed_on DATE)')
+        con.execute('INSERT INTO "test-project__bqemu"."placements" VALUES (\'2024-05-15\')')
+        schema = {"placements": {"placed_on": "DATE"}}
+        result = t.translate(
+            "SELECT DATE_TRUNC(placed_on, WEEK(SUNDAY)) AS week_start, "
+            "DATE_ADD(placed_on, INTERVAL 1 DAY) AS unrelated "
+            "FROM `test-project.bqemu.placements`",
+            schema=schema,
+        )
+        assert isinstance(result, Ok)
+        duckdb_sql = result.value.replace(
+            '"test-project"."bqemu"."placements"',
+            '"test-project__bqemu"."placements"',
+        )
+        row = con.execute(duckdb_sql).fetchone()
+        assert row[0] == _dt.date(2024, 5, 12)  # Sunday-start week, not Monday-start
