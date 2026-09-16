@@ -15,9 +15,13 @@ recognises only the unqualified keywords and its ``DATE_TRUNC`` widens
 
 * ``DATE_TRUNC(date, ISOYEAR)`` — DuckDB *does* recognise ``ISOYEAR``
   but returns a ``TIMESTAMP`` rather than the BigQuery contract's
-  ``DATE``. The rule wraps the call in a ``CAST(... AS DATE)`` so the
-  Arrow column type lands on ``date32`` and the REST schema renders
-  the column as ``DATE`` (the BigQuery wire-format expectation).
+  ``DATE``. Wrap in ``CAST(... AS DATE)`` when the operand is provably
+  DATE-typed (a ``CAST(... AS DATE)``, a ``CURRENT_DATE()``, or a
+  schema-annotated DATE column) so the Arrow column type lands on
+  ``date32`` and the REST schema renders the column as ``DATE`` (the
+  BigQuery wire-format expectation); non-DATE operands (TIMESTAMP /
+  DATETIME, via ``TIMESTAMP_TRUNC`` / ``DATETIME_TRUNC``) flow through
+  unchanged so their wire-format type stays correct.
 
 * ``DATE_TRUNC(date, DAY | MONTH | QUARTER | YEAR)`` (ADR 0023 §1.B
   for QUARTER, §1.I for the rest) — DuckDB's ``DATE_TRUNC`` returns a
@@ -42,21 +46,13 @@ from bqemulator.sql.rules._base import TranslationRule
 
 _ISOWEEK_SYNONYM = "WEEK"
 
-#: The node class(es) SQLGlot uses to represent a ``DATE_TRUNC(...)`` call,
-#: depending on *when* the tree was produced. A single-shot
-#: ``sqlglot.transpile(bq_sql, read="bigquery", write="duckdb")`` keeps the
-#: BigQuery-parsed shape (``exp.DateTrunc``) all the way through. But
-#: :meth:`SQLTranslator._apply_rules` re-parses the *already-transpiled*
-#: DuckDB SQL text (``sqlglot.parse_one(sql, read="duckdb")``) before
-#: walking it for post-translator rules — and SQLGlot's DuckDB dialect
-#: parses ``DATE_TRUNC('unit', date)`` into ``exp.TimestampTrunc``, not
-#: ``exp.DateTrunc`` (verified for every unit: ISOYEAR/DAY/MONTH/QUARTER/
-#: YEAR/WEEK). Matching only ``exp.DateTrunc`` therefore makes every rule
-#: in this module unreachable at the point they are meant to act as a
-#: safety net — they silently never fire, and the call falls through to
-#: DuckDB's un-adjusted (Monday-start / TIMESTAMP-returning) default with
-#: no error. Both node classes carry the same ``.this`` (operand) /
-#: ``args["unit"]`` shape, so matching either is safe.
+#: The node class(es) SQLGlot uses to represent a ``DATE_TRUNC(...)`` call.
+#: :meth:`SQLTranslator._apply_rules` parses the transpiled DuckDB SQL text
+#: with ``sqlglot.parse_one(sql, read="duckdb")`` before walking it for
+#: these rules, and SQLGlot's DuckDB dialect parses ``DATE_TRUNC('unit',
+#: date)`` into ``exp.TimestampTrunc``, not ``exp.DateTrunc``. Both node
+#: classes carry the same ``.this`` (operand) / ``args["unit"]`` shape, so
+#: matching either is safe.
 _DATE_TRUNC_NODE_TYPES = (exp.DateTrunc, exp.TimestampTrunc)
 
 
@@ -87,17 +83,22 @@ class DateTruncIsoyearRule(TranslationRule):
     Without the outer cast, DuckDB returns the truncated value as
     ``TIMESTAMP``; BigQuery returns ``DATE``. The cast both fixes the
     schema (Arrow ``date32``) and the wire-rendered value (no time
-    component).
+    component). Only fires when the operand is provably DATE-typed;
+    ``TIMESTAMP_TRUNC`` / ``DATETIME_TRUNC`` calls with an ``ISOYEAR``
+    unit parse to the same node shape but must keep their
+    TIMESTAMP/DATETIME result type.
     """
 
     name = "DATE_TRUNC_ISOYEAR"
 
     def applies_to(self, node: exp.Expression) -> bool:
-        """Match ``DATE_TRUNC`` calls whose unit is ``ISOYEAR``."""
+        """Match ``DATE_TRUNC`` calls whose unit is ``ISOYEAR`` over a DATE-typed operand."""
         if not isinstance(node, _DATE_TRUNC_NODE_TYPES):
             return False
         unit = node.args.get("unit")
-        return unit is not None and _name(unit).upper() == "ISOYEAR"
+        if unit is None or _name(unit).upper() != "ISOYEAR":
+            return False
+        return _is_date_typed(node.this)
 
     def rewrite(self, node: exp.Expression) -> exp.Expression:
         """Wrap the original call in ``CAST(... AS DATE)``."""
@@ -180,28 +181,21 @@ class DateTruncWeekRule(TranslationRule):
 def _is_date_typed(node: exp.Expression | None) -> bool:
     """Return True when *node* is provably a DATE-typed expression.
 
-    Covers the two BigQuery-side syntactic forms that always produce a
-    DATE after the SQLGlot transpile: an explicit ``CAST(... AS DATE)``
-    (which is what ``DATE '…'`` typed literals collapse to), and
-    ``CURRENT_DATE()`` / ``CURRENT_DATE``.
-
-    It also trusts the operand's annotated ``.type`` when the caller
-    ran the translator with a ``schema`` — SQLGlot's ``annotate_types``
-    pass (``SQLTranslator._annotate_tree``) resolves table/column
-    references against that schema and attaches a ``DataType`` to each
-    node. Without this check, a bare reference to a schema-declared
-    DATE column (e.g. ``pl.placed_on`` in a JOINed/aliased query) was
-    never recognised as DATE-typed, silently disabling the
-    Sunday-start rewrite for ``DATE_TRUNC(date_col, WEEK)`` over real
-    table columns — the call fell through to DuckDB's Monday-start
-    default with no error, so the wrong week boundary was returned
-    instead of raising.
+    Recognises three forms: an explicit ``CAST(... AS DATE)`` (which
+    is what ``DATE '…'`` typed literals collapse to), ``CURRENT_DATE()``
+    / ``CURRENT_DATE``, and — when the caller ran the translator with a
+    ``schema`` — the operand's annotated ``.type``. SQLGlot's
+    ``annotate_types`` pass (``SQLTranslator._annotate_tree``) resolves
+    table/column references against that schema and attaches a
+    ``DataType`` to each node, so a bare reference to a schema-declared
+    DATE column (e.g. ``pl.placed_on`` in a JOINed/aliased query) is
+    recognised as DATE-typed too.
 
     Sub-expressions whose type the translator cannot statically
     determine (no schema supplied, or annotation failed for that
-    query) still fall through — the matching rule leaves the call
-    alone, preserving DuckDB's default behaviour for TIMESTAMP /
-    DATETIME operands.
+    query) fall through — the matching rule leaves the call alone,
+    preserving DuckDB's default behaviour for TIMESTAMP / DATETIME
+    operands.
     """
     if node is None:
         return False
