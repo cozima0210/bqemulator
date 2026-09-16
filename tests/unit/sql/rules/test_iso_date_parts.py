@@ -88,6 +88,32 @@ class TestDateTruncIsoyear:
             truncated = truncated.date()
         assert truncated == _dt.date(2024, 3, 1)
 
+    def test_timestamp_operand_not_cast_to_date(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        # TIMESTAMP_TRUNC(..., ISOYEAR) parses to the same node shape as
+        # DATE_TRUNC(..., ISOYEAR) once re-parsed as DuckDB SQL, but the
+        # rule must NOT cast a TIMESTAMP operand to DATE — DuckDB's
+        # natural behaviour (return TIMESTAMP) is the correct one here.
+        result = t.translate(
+            "SELECT TIMESTAMP_TRUNC(TIMESTAMP '2024-01-02 12:00:00 UTC', ISOYEAR) AS d",
+        )
+        assert isinstance(result, Ok)
+        desc = con.execute(result.value).description
+        assert "TIMESTAMP" in str(desc[0][1]).upper()
+
+    def test_datetime_operand_not_cast_to_date(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        # Same as above for DATETIME_TRUNC(..., ISOYEAR).
+        result = t.translate(
+            "SELECT DATETIME_TRUNC(DATETIME '2024-01-02 12:00:00', ISOYEAR) AS d",
+        )
+        assert isinstance(result, Ok)
+        desc = con.execute(result.value).description
+        assert "TIMESTAMP" in str(desc[0][1]).upper() or "DATETIME" in str(desc[0][1]).upper()
+        assert desc[0][1] != "DATE"
+
 
 class TestDateTruncQuarter:
     """``DATE_TRUNC(date, QUARTER)`` → ``CAST(... AS DATE)``."""
@@ -148,33 +174,15 @@ class TestDateTruncWeek:
 
 
 class TestDateTruncOverTableColumn:
-    """Regression: ``DATE_TRUNC(date_col, …)`` over a real table column.
+    """``DATE_TRUNC(date_col, …)`` over a schema-typed table column.
 
-    The tests above only exercise ``DATE_TRUNC`` over a ``DATE '…'``
-    literal. That hid two compounding bugs that only surface once the
-    operand is a schema-typed table column instead of a literal:
-
-    1. :func:`bqemulator.sql.rules.iso_date_parts._is_date_typed`
-       recognised only literal ``CAST(... AS DATE)`` / ``CURRENT_DATE()``
-       operands — never a column resolved DATE-typed via
-       ``annotate_types`` (the ``schema=`` translate() argument).
-    2. Every rule in this module matched only ``isinstance(node,
-       exp.DateTrunc)``. That is the shape SQLGlot's *single-shot*
-       ``sqlglot.transpile(read="bigquery", write="duckdb")`` keeps end
-       to end, but :meth:`SQLTranslator._apply_rules` re-parses the
-       *already-transpiled* DuckDB SQL text
-       (``sqlglot.parse_one(sql, read="duckdb")``) before applying these
-       rules — and SQLGlot's DuckDB parser turns ``DATE_TRUNC(unit,
-       date)`` into ``exp.TimestampTrunc``, not ``exp.DateTrunc``, for
-       every unit. So whenever a rule needed to act as the safety net at
-       that re-parse stage (see the multi-CTE regression below), it
-       silently never matched and the call fell straight through to
-       DuckDB's un-adjusted default.
-
-    Both bugs needed fixing together: (1) alone still leaves the
-    isinstance check unreachable at the re-parse stage; (2) alone still
-    leaves ``_is_date_typed`` blind to column operands, so the rule
-    matches the node but declines to rewrite it.
+    Exercises the rules in :mod:`bqemulator.sql.rules.iso_date_parts`
+    with a real table column rather than a ``DATE '…'`` literal:
+    ``_is_date_typed`` must recognise the column via the annotated
+    ``.type`` SQLGlot's ``annotate_types`` pass attaches when
+    ``translate()`` is called with a ``schema``, and the rules must
+    match the ``exp.TimestampTrunc`` node shape SQLGlot's DuckDB
+    dialect produces when re-parsing the transpiled SQL.
     """
 
     def test_week_over_column_matches_literal(
@@ -224,23 +232,38 @@ class TestDateTruncOverTableColumn:
         row = con.execute(duckdb_sql).fetchone()
         assert row == (_dt.date(2024, 1, 1),)
 
+    def test_isoyear_over_timestamp_column_not_cast_to_date(
+        self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
+    ) -> None:
+        con.execute('CREATE SCHEMA "test-project__bqemu"')
+        con.execute('CREATE TABLE "test-project__bqemu"."events" (happened_at TIMESTAMP)')
+        con.execute(
+            'INSERT INTO "test-project__bqemu"."events" VALUES (\'2024-01-02 12:00:00\')',
+        )
+        schema = {"events": {"happened_at": "TIMESTAMP"}}
+        result = t.translate(
+            "SELECT TIMESTAMP_TRUNC(happened_at, ISOYEAR) AS d FROM `test-project.bqemu.events`",
+            schema=schema,
+        )
+        assert isinstance(result, Ok)
+        duckdb_sql = result.value.replace(
+            '"test-project"."bqemu"."events"',
+            '"test-project__bqemu"."events"',
+        )
+        desc = con.execute(duckdb_sql).description
+        assert desc[0][1] != "DATE"
+
     def test_week_over_column_survives_unrelated_date_add_in_same_query(
         self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
     ) -> None:
-        """Regression for the multi-CTE production query that surfaced this.
-
-        ``rewrite_datetime_helpers`` (the ``DATE_ADD``/``DATE_SUB`` /
-        ``DATE_FROM_UNIX_DATE`` pre-translator) re-parses the *entire*
-        BigQuery SQL text and re-serialises it back to BigQuery dialect
-        whenever the query contains any of those calls — even ones
-        unrelated to the ``DATE_TRUNC`` this test cares about. That
-        parse → re-emit round trip drops the ``WEEK(SUNDAY)`` day
-        qualifier down to bare ``WEEK`` (a SQLGlot BigQuery-generator
-        gap, tracked separately). This test locks in that the *result*
-        is still correct even though the qualifier gets lost along the
-        way — the DateTruncWeekRule safety net for bare ``WEEK`` must
-        still catch it once the operand is a real DATE column.
-        """
+        # ``rewrite_datetime_helpers`` (the ``DATE_ADD``/``DATE_SUB`` /
+        # ``DATE_FROM_UNIX_DATE`` pre-translator) re-parses the entire
+        # BigQuery SQL text and re-serialises it whenever the query
+        # contains any of those calls — even ones unrelated to the
+        # DATE_TRUNC this test cares about — which drops the
+        # ``WEEK(SUNDAY)`` day qualifier down to bare ``WEEK``. The
+        # DateTruncWeekRule safety net for bare ``WEEK`` must still
+        # produce the correct Sunday-start result over a real DATE column.
         con.execute('CREATE SCHEMA "test-project__bqemu"')
         con.execute('CREATE TABLE "test-project__bqemu"."placements" (placed_on DATE)')
         con.execute('INSERT INTO "test-project__bqemu"."placements" VALUES (\'2024-05-15\')')
