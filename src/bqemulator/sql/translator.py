@@ -96,6 +96,22 @@ def _resolve_caller(caller: CallerIdentity | None) -> CallerIdentity:
     return CallerIdentity(principal=DEFAULT_CALLER, is_authenticated=False)
 
 
+def _identifier_key(identifier: exp.Identifier) -> str:
+    """Return a lookup key for *identifier* under BigQuery's matching rule.
+
+    Unquoted identifiers match case-insensitively; quoted ones match
+    only their exact spelling. The two namespaces never overlap — an
+    unquoted and a quoted identifier of the same spelling never
+    produce the same key — via a namespace prefix distinguishing the
+    two, since folding case alone (e.g. lower-casing both) could
+    otherwise coincidentally collide an unquoted identifier with a
+    quoted one that happens to already be all-lowercase.
+    """
+    if identifier.args.get("quoted"):
+        return f"q:{identifier.name}"
+    return f"u:{identifier.name.lower()}"
+
+
 class SQLTranslator:
     """Translates BigQuery GoogleSQL to DuckDB SQL.
 
@@ -343,13 +359,16 @@ class SQLTranslator:
         # 3. Post-process: parse the DuckDB SQL back into an AST, apply
         #    custom rules, then re-serialize. Rules that detect an
         #    explicitly out-of-scope feature can raise
-        #    :class:`UnsupportedFeatureError`; we propagate that as a
-        #    clean ``Err`` rather than letting it bubble through.
+        #    :class:`UnsupportedFeatureError`, and a rule that detects
+        #    a semantically invalid query (e.g. an ambiguous ``GROUP
+        #    BY`` alias reference) can raise :class:`InvalidQueryError`;
+        #    we propagate both as a clean ``Err`` rather than letting
+        #    them bubble through as uncaught exceptions.
         duckdb_sql = transpiled_list[0]
         if self._rules:
             try:
                 duckdb_sql = self._apply_rules(duckdb_sql, schema=schema)
-            except UnsupportedFeatureError as exc:
+            except (UnsupportedFeatureError, InvalidQueryError) as exc:
                 return Err(exc)
 
         _log.debug(
@@ -452,8 +471,7 @@ class SQLTranslator:
             for idx, projection in enumerate(select.expressions, start=1):
                 if not isinstance(projection, exp.Alias):
                     continue
-                alias_id = projection.args["alias"]
-                key = alias_id.name if alias_id.args.get("quoted") else alias_id.name.lower()
+                key = _identifier_key(projection.args["alias"])
                 if key in alias_positions:
                     ambiguous_keys.add(key)
                 else:
@@ -468,7 +486,7 @@ class SQLTranslator:
                     and not item.table
                     and isinstance(item.this, exp.Identifier)
                 ):
-                    key = item.name if item.this.args.get("quoted") else item.name.lower()
+                    key = _identifier_key(item.this)
                 if key is not None and key in ambiguous_keys:
                     raise InvalidQueryError(
                         f"Column name {item.name} is ambiguous",
