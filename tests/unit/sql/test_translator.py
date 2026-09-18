@@ -126,6 +126,95 @@ class TestErrorHandling:
         assert not (isinstance(result, Err) and isinstance(result.error, UnsupportedFeatureError))
 
 
+class TestGroupByAliasOrdinalRewrite:
+    """``GROUP BY <select-list alias>`` over a multi-hop join.
+
+    DuckDB's binder resolves a bare ``GROUP BY`` identifier against
+    the FROM-clause's real columns *before* falling back to a
+    SELECT-list alias of the same name — the opposite priority of
+    BigQuery's "GROUP BY <alias>" feature, which always means "group
+    by this SELECT-list slot" regardless of what real column shares
+    its name. When a query aliases 2+ output columns to names that
+    also exist as real columns reachable through >=3 joins (e.g.
+    ``pr.id AS project_id`` alongside a real ``processes.project_id``
+    two joins closer to the FROM clause), the naive alias-as-written
+    SQL either mis-resolves silently to the wrong column or trips
+    DuckDB's "column ... must appear in the GROUP BY clause" binder
+    error outright. ``SQLTranslator._expand_group_by_aliases_to_ordinals``
+    rewrites such items to their 1-based SELECT-list ordinal before the
+    DuckDB SQL is finalized, which is unambiguous — an ordinal maps
+    directly to the SELECT list, no name resolution involved — and
+    preserves exactly what "GROUP BY <alias>" means.
+    """
+
+    def test_group_by_alias_colliding_with_real_column_becomes_ordinal(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        sql = """
+        SELECT pr.id AS project_id, pr.name AS project_name
+        FROM pl
+        JOIN t ON t.id = pl.task_id
+        JOIN proc ON proc.id = t.process_id
+        JOIN pr ON pr.id = proc.project_id
+        GROUP BY project_id, project_name
+        """
+        result = translator.translate(sql)
+        assert isinstance(result, Ok)
+        assert "GROUP BY 1, 2" in result.value
+
+    def test_group_by_alias_not_colliding_is_left_alone(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A GROUP BY item that names no SELECT-list alias must not be touched.
+
+        Guards against the rewrite over-firing on a query where
+        ``category`` is both the DB column and the alias.
+        """
+        result = translator.translate(
+            "SELECT category, COUNT(*) AS cnt FROM t GROUP BY category",
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY" in result.value
+        assert "GROUP BY 1" not in result.value
+
+    def test_group_by_alias_ordinal_query_result_is_correct(self) -> None:
+        """End-to-end: the rewritten ordinal form binds and groups correctly.
+
+        Reproduces the exact shape that triggered the DuckDB binder
+        error / silent misgrouping: a distant-table alias
+        (``project_id``) colliding with a same-named real column two
+        joins closer to the FROM clause.
+        """
+        import duckdb
+
+        translator = SQLTranslator()
+        sql = """
+        SELECT pr.id AS project_id, pr.name AS project_name, SUM(1) AS hours
+        FROM pl
+        JOIN t ON t.id = pl.task_id
+        JOIN proc ON proc.id = t.process_id
+        JOIN pr ON pr.id = proc.project_id
+        GROUP BY project_id, project_name
+        """
+        result = translator.translate(sql)
+        assert isinstance(result, Ok)
+
+        con = duckdb.connect()
+        con.execute("CREATE TABLE pl(id VARCHAR, task_id VARCHAR)")
+        con.execute("CREATE TABLE t(id VARCHAR, process_id VARCHAR)")
+        con.execute("CREATE TABLE proc(id VARCHAR, project_id VARCHAR)")
+        con.execute("CREATE TABLE pr(id VARCHAR, name VARCHAR)")
+        con.execute("INSERT INTO pl VALUES ('pl1', 't1')")
+        con.execute("INSERT INTO t VALUES ('t1', 'proc1')")
+        con.execute("INSERT INTO proc VALUES ('proc1', 'pr1')")
+        con.execute("INSERT INTO pr VALUES ('pr1', 'Project1')")
+
+        rows = con.execute(result.value).fetchall()
+        assert rows == [("pr1", "Project1", 1)]
+
+
 class TestTranslatorIsStateless:
     def test_multiple_calls_independent(self, translator: SQLTranslator) -> None:
         r1 = translator.translate("SELECT 1")

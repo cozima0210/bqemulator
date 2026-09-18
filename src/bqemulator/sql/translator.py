@@ -389,10 +389,27 @@ class SQLTranslator:
         # narrows it for the rest of the function and the helpers.
         assert isinstance(tree, exp.Expression)  # noqa: S101
 
-        if schema is not None:
-            tree = self._annotate_tree(tree, schema)
+        # GROUP BY items that name a SELECT-list alias must be rewritten
+        # to their ordinal position *before* qualify() runs. DuckDB's
+        # binder resolves a bare GROUP BY identifier against the
+        # FROM-clause's real columns first, only falling back to a
+        # SELECT-list alias of the same name — the opposite priority of
+        # BigQuery's "GROUP BY <alias>" feature. A query that aliases an
+        # output column to a name that also exists as a real column
+        # elsewhere in scope (reachable through the join graph) either
+        # silently groups by the wrong column or trips DuckDB's "column
+        # ... must appear in the GROUP BY clause" binder error — and
+        # running it through ``qualify()`` resolves the *same* ambiguity
+        # the *same* wrong way, since qualify() performs the identical
+        # column-before-alias lookup. An ordinal is positional, not
+        # name-based, so it carries no such ambiguity and is exactly
+        # what "GROUP BY <alias>" means: "group by this SELECT-list
+        # slot".
+        modified = self._expand_group_by_aliases_to_ordinals(tree)
 
-        modified = False
+        if schema is not None:
+            tree, _qualified_ok = self._annotate_tree(tree, schema)
+
         # Snapshot nodes pre-order, then iterate in reverse — children
         # of any parent appear *after* the parent in pre-order, so
         # ``reversed(...)`` gives us a post-order-equivalent traversal.
@@ -406,13 +423,56 @@ class SQLTranslator:
         return sql
 
     @staticmethod
+    def _expand_group_by_aliases_to_ordinals(tree: exp.Expression) -> bool:
+        """Rewrite GROUP BY items naming a SELECT-list alias to their ordinal.
+
+        For every ``SELECT`` in ``tree`` with a ``GROUP BY`` clause,
+        replaces each bare (unqualified) GROUP BY column reference that
+        matches one of that SELECT's output aliases with a 1-based
+        ordinal literal pointing at that SELECT-list position. Returns
+        ``True`` if any replacement was made.
+        """
+        modified = False
+        for select in tree.find_all(exp.Select):
+            group = select.args.get("group")
+            if group is None:
+                continue
+            alias_positions: dict[str, int] = {}
+            for idx, projection in enumerate(select.expressions, start=1):
+                alias = projection.alias if isinstance(projection, exp.Alias) else None
+                if alias:
+                    alias_positions[alias] = idx
+            if not alias_positions:
+                continue
+            new_expressions = []
+            for item in group.expressions:
+                position = (
+                    alias_positions.get(item.name)
+                    if isinstance(item, exp.Column) and not item.table
+                    else None
+                )
+                if position is None:
+                    new_expressions.append(item)
+                else:
+                    new_expressions.append(exp.Literal.number(position))
+                    modified = True
+            if new_expressions != group.expressions:
+                group.set("expressions", new_expressions)
+        return modified
+
+    @staticmethod
     def _annotate_tree(
         tree: exp.Expression,
         schema: dict[str, Any],
-    ) -> exp.Expression:
+    ) -> tuple[exp.Expression, bool]:
         """Run SQLGlot's ``qualify`` + ``annotate_types`` passes.
 
-        Failures are logged and the unannotated tree is returned;
+        Returns ``(tree, True)`` on success — ``qualify()`` also
+        expands GROUP BY/ORDER BY references to SELECT-list aliases
+        into their underlying expressions, which callers rely on to
+        decide whether the qualified SQL (rather than the original)
+        must be re-serialized. Failures are logged and
+        ``(tree, False)`` is returned with the unannotated tree;
         rules that need type info gracefully skip. The runtime
         ``isinstance`` check narrows SQLGlot's loosely-typed
         ``Expr`` return to :class:`exp.Expression` without resorting
@@ -424,9 +484,9 @@ class SQLTranslator:
             annotated = annotate_types(qualified, schema=schema)
         except Exception as exc:  # noqa: BLE001
             _log.debug("sql.annotate_types_skipped", error=str(exc))
-            return tree
+            return tree, False
         assert isinstance(annotated, exp.Expression)  # noqa: S101 — stub-bridge narrowing
-        return annotated
+        return annotated, True
 
     def _apply_first_matching_rule(
         self,
