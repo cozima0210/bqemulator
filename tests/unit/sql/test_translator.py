@@ -237,62 +237,78 @@ class TestGroupByAliasOrdinalRewrite:
         assert isinstance(result, Ok)
         assert "GROUP BY 1, 2" in result.value
 
-    def test_group_by_quoted_item_does_not_match_unquoted_alias(
+    def test_group_by_backtick_quoted_item_matches_unquoted_alias(
         self,
         translator: SQLTranslator,
     ) -> None:
-        """A backtick-quoted GROUP BY identifier keeps case-sensitive matching.
+        """A backtick-quoted GROUP BY identifier still matches case-insensitively.
 
-        BigQuery quotes identifiers with backticks (double quotes are
-        a string literal, not an identifier — ``GROUP BY "x"`` groups
-        by a constant, which is a different, degenerate case this
-        rewrite never touches since it isn't a column reference at
-        all). Guards against the case-insensitive fold over-firing:
-        quoting opts an identifier out of the fold, so a
-        backtick-quoted, exact-case ``GROUP BY`` item must not be
-        confused with an unquoted alias of a different case.
+        BigQuery's column and alias names are case-insensitive
+        regardless of backtick quoting — quoting is identifier syntax
+        (escaping reserved words, allowing special characters), not a
+        switch to case-sensitive matching. A backtick-quoted, oddly
+        cased ``GROUP BY`` item must still resolve to an unquoted
+        alias of a different case.
         """
         result = translator.translate(
             "SELECT a AS project_id FROM t GROUP BY `Project_ID`",
         )
         assert isinstance(result, Ok)
-        assert "GROUP BY 1" not in result.value
+        assert "GROUP BY 1" in result.value
 
-    def test_quoted_alias_does_not_match_unquoted_group_by_of_same_spelling(
+    def test_group_by_double_quoted_string_literal_is_not_a_column_reference(
         self,
         translator: SQLTranslator,
     ) -> None:
-        """A quoted alias and an unquoted GROUP BY item never match.
+        """``GROUP BY "x"`` groups by a string-literal constant, not a column.
 
-        Guards against folding both to the same lookup key: a
-        backtick-quoted alias and an unquoted ``GROUP BY`` item happen
-        to share a spelling here, but quoted and unquoted identifiers
-        are different namespaces and must never be confused for each
-        other, even when case-folding would otherwise make their keys
-        collide.
+        BigQuery quotes *identifiers* with backticks; a double-quoted
+        token is a string literal. ``GROUP BY "Project_ID"`` is
+        therefore a degenerate case this rewrite never touches (it
+        isn't a column reference at all), regardless of any alias
+        named ``project_id``.
+        """
+        result = translator.translate(
+            'SELECT a AS project_id FROM t GROUP BY "Project_ID"',
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY 1" not in result.value
+
+    def test_backtick_quoted_alias_matches_unquoted_group_by_of_same_spelling(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A backtick-quoted alias and an unquoted GROUP BY item still match.
+
+        Quoting an alias doesn't create a separate, case-sensitive
+        identifier namespace in BigQuery — an unquoted ``GROUP BY``
+        item resolves to a backtick-quoted alias of the same spelling
+        the same way it would an unquoted one.
         """
         result = translator.translate(
             "SELECT a AS `foo` FROM t GROUP BY foo",
         )
         assert isinstance(result, Ok)
-        assert "GROUP BY 1" not in result.value
+        assert "GROUP BY 1" in result.value
 
-    def test_quoted_and_unquoted_aliases_of_same_spelling_are_not_ambiguous(
+    def test_backtick_quoted_and_unquoted_aliases_of_same_spelling_are_ambiguous(
         self,
         translator: SQLTranslator,
     ) -> None:
-        """A quoted and an unquoted alias of the same spelling are distinct.
+        """A backtick-quoted and an unquoted alias of the same spelling are the same alias.
 
-        They occupy different namespaces (BigQuery's quoting rule), so
-        having both in the same SELECT list is not the duplicate-alias
-        case — an unquoted GROUP BY reference must resolve to the
-        unquoted alias's ordinal, not get flagged ambiguous.
+        Quoting doesn't create a distinct identifier, so this is the
+        ordinary duplicate-alias case: a ``GROUP BY`` item referencing
+        the shared name is ambiguous, whichever form it or the
+        aliases use.
         """
+        from bqemulator.domain.errors import InvalidQueryError
+
         result = translator.translate(
             "SELECT a AS `foo`, b AS foo FROM t GROUP BY foo",
         )
-        assert isinstance(result, Ok)
-        assert "GROUP BY 2" in result.value
+        assert isinstance(result, Err)
+        assert isinstance(result.error, InvalidQueryError)
 
     def test_group_by_referencing_duplicated_alias_is_ambiguous(
         self,

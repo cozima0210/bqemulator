@@ -18,10 +18,10 @@ Resolve a bare (unqualified) `GROUP BY` item that names one of the query's own
 `SELECT`-list aliases to that alias's ordinal position, matching BigQuery's
 "`GROUP BY` clauses may also refer to aliases" rule, instead of letting
 DuckDB's binder resolve it against a same-named real column first. Alias
-matching follows BigQuery's identifier rules: case-insensitive when unquoted,
-case-sensitive when quoted, and an error — not a guess — when the `GROUP BY`
-item names an alias that the `SELECT` list assigned to more than one
-projection.
+matching follows BigQuery's identifier rules — always case-insensitive,
+regardless of backtick quoting on either side — and raises an error, not a
+guess, when the `GROUP BY` item names an alias that the `SELECT` list
+assigned to more than one projection.
 
 ## Motivation
 
@@ -68,12 +68,11 @@ GROUP BY 1, 2
 
 Matching follows BigQuery's own identifier-resolution rules:
 
-- **Case-insensitive when unquoted.** `GROUP BY project_id` matches
-  `AS Project_ID` — an unquoted identifier is the same identifier regardless
-  of how it's cased.
-- **Case-sensitive when quoted.** A backtick-quoted `GROUP BY \`Project_ID\``
-  in the original BigQuery text only matches an alias of the exact same case;
-  quoting opts an identifier out of the fold.
+- **Always case-insensitive, quoted or not.** `GROUP BY project_id` matches
+  `AS Project_ID`, and a backtick-quoted `GROUP BY \`Project_ID\`` matches
+  an unquoted `AS project_id` just the same — backticks are identifier
+  *syntax* (escaping reserved words, allowing special characters), not a
+  switch to case-sensitive matching, unlike some other SQL dialects.
 - **Ambiguous when the alias is duplicated and referenced.** BigQuery
   permits a `SELECT` list to reuse the same alias on more than one
   projection, *as long as nothing in the query refers to it*. A `GROUP BY`
@@ -98,12 +97,11 @@ For each `SELECT` with a `GROUP BY` clause:
 
 1. Build a map from alias key to 1-based `SELECT`-list ordinal, over every
    projection that is an explicit `exp.Alias`. The key is the alias's
-   identifier text unchanged when the identifier is quoted, or lower-cased
-   when it isn't. A second alias producing an already-seen key marks that key
-   ambiguous instead of overwriting the first ordinal.
+   identifier text, lower-cased regardless of quoting. A second alias
+   producing an already-seen key marks that key ambiguous instead of
+   overwriting the first ordinal.
 2. For each `GROUP BY` item that is a bare (no table-qualifier) column
-   reference, compute the same kind of key from its own identifier
-   (quoted → verbatim, unquoted → lower-cased).
+   reference, compute the same lower-cased key from its own identifier.
    - If the key is marked ambiguous, raise `InvalidQueryError` ("Column name
      `<name>` is ambiguous").
    - Else if the key matches a recorded alias, replace the item with a

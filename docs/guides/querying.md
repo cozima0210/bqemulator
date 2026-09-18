@@ -36,10 +36,12 @@ JOIN projects pr ON pr.id = proc.project_id
 GROUP BY project_id, project_name
 ```
 
-Alias matching is case-insensitive when unquoted (`GROUP BY project_id`
-matches `AS Project_ID`) and case-sensitive when quoted. A `GROUP BY` item
-that names an alias the `SELECT` list assigned to more than one
-projection is rejected as ambiguous — BigQuery permits the duplication,
+Alias matching is always case-insensitive (`GROUP BY project_id` matches
+`AS Project_ID`), regardless of backtick quoting on either side — quoting
+doesn't create a separate, case-sensitive identifier namespace in
+BigQuery. A `GROUP BY` item that names an alias the `SELECT` list
+assigned to more than one projection is rejected as ambiguous — BigQuery
+permits the duplication,
 but only as long as nothing references it.
 
 ## Caching
