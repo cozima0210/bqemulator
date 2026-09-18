@@ -99,17 +99,14 @@ def _resolve_caller(caller: CallerIdentity | None) -> CallerIdentity:
 def _identifier_key(identifier: exp.Identifier) -> str:
     """Return a lookup key for *identifier* under BigQuery's matching rule.
 
-    Unquoted identifiers match case-insensitively; quoted ones match
-    only their exact spelling. The two namespaces never overlap — an
-    unquoted and a quoted identifier of the same spelling never
-    produce the same key — via a namespace prefix distinguishing the
-    two, since folding case alone (e.g. lower-casing both) could
-    otherwise coincidentally collide an unquoted identifier with a
-    quoted one that happens to already be all-lowercase.
+    Column and alias names are case-insensitive in BigQuery regardless
+    of backtick quoting — quoting is identifier *syntax* (escaping
+    reserved words, allowing special characters), not a switch to
+    case-sensitive matching, unlike some other SQL dialects. So
+    ``AS `foo``` and ``AS foo`` name the same alias, and a bare
+    ``GROUP BY foo`` matches a backtick-quoted ``AS `Foo``` alias too.
     """
-    if identifier.args.get("quoted"):
-        return f"q:{identifier.name}"
-    return f"u:{identifier.name.lower()}"
+    return identifier.name.lower()
 
 
 class SQLTranslator:
@@ -451,10 +448,10 @@ class SQLTranslator:
         ordinal literal pointing at that SELECT-list position. Returns
         ``True`` if any replacement was made.
 
-        Alias matching is case-insensitive for unquoted identifiers
-        (BigQuery's own resolution rule) and case-sensitive for quoted
-        ones; an unquoted and a quoted identifier never match each
-        other. When two SELECT-list aliases collide under this rule,
+        Alias matching is always case-insensitive (BigQuery's own
+        resolution rule for column and alias names), regardless of
+        backtick quoting on either side — see :func:`_identifier_key`.
+        When two SELECT-list aliases collide under this rule,
         BigQuery's own semantics permit the duplication as long as
         nothing references it — only a ``GROUP BY`` item that actually
         names the colliding alias is an error, raised here as
