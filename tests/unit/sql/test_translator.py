@@ -214,6 +214,81 @@ class TestGroupByAliasOrdinalRewrite:
         rows = con.execute(result.value).fetchall()
         assert rows == [("pr1", "Project1", 1)]
 
+    def test_group_by_matches_alias_case_insensitively(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """An unquoted GROUP BY item matches a differently-cased alias.
+
+        BigQuery resolves unquoted identifiers case-insensitively, so
+        ``GROUP BY project_id`` must still hit the ``AS Project_ID``
+        alias (and therefore its ordinal) even though the two differ
+        in case.
+        """
+        sql = """
+        SELECT pr.id AS Project_ID, pr.name AS project_name
+        FROM pl
+        JOIN t ON t.id = pl.task_id
+        JOIN proc ON proc.id = t.process_id
+        JOIN pr ON pr.id = proc.project_id
+        GROUP BY project_id, PROJECT_NAME
+        """
+        result = translator.translate(sql)
+        assert isinstance(result, Ok)
+        assert "GROUP BY 1, 2" in result.value
+
+    def test_group_by_quoted_item_does_not_match_unquoted_alias(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A quoted GROUP BY identifier keeps case-sensitive matching.
+
+        Guards against the case-insensitive fold over-firing: quoting
+        opts an identifier out of the fold, so ``GROUP BY "Project_ID"``
+        (quoted, exact case) must not be confused with an unquoted
+        alias of a different case.
+        """
+        result = translator.translate(
+            'SELECT a AS project_id FROM t GROUP BY "Project_ID"',
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY 1" not in result.value
+
+    def test_group_by_referencing_duplicated_alias_is_ambiguous(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A GROUP BY item naming a duplicated alias must error, not guess.
+
+        GoogleSQL permits a SELECT list to reuse the same output alias
+        as long as it is never referenced elsewhere in the query; a
+        ``GROUP BY`` item that does reference it is ambiguous and must
+        be rejected rather than silently resolved to whichever
+        projection happened to be assigned to the alias last.
+        """
+        from bqemulator.domain.errors import InvalidQueryError
+
+        with pytest.raises(InvalidQueryError):
+            translator.translate(
+                "SELECT COUNT(*) AS key, category AS key FROM t GROUP BY key",
+            )
+
+    def test_group_by_ignores_unreferenced_duplicated_alias(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A duplicated alias that GROUP BY never names stays untouched.
+
+        Only a reference to the ambiguous alias must error — a
+        ``GROUP BY`` clause naming some other, unambiguous column must
+        keep working.
+        """
+        result = translator.translate(
+            "SELECT COUNT(*) AS key, category AS key, region FROM t GROUP BY region",
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY" in result.value
+
 
 class TestTranslatorIsStateless:
     def test_multiple_calls_independent(self, translator: SQLTranslator) -> None:
