@@ -261,6 +261,16 @@ def _build_week_saturday(operand: exp.Expression) -> exp.Expression:
 def _rewrite_date_trunc_week_monday(tree: exp.Expression) -> bool:
     """Replace every ``DATE_TRUNC(x, WEEK(MONDAY))`` with Monday-start date math.
 
+    Only ``exp.DateTrunc`` — never ``exp.TimestampTrunc`` /
+    ``exp.DatetimeTrunc`` — is a candidate: this pass's output is
+    always cast to ``DATE`` (matching ``DATE_TRUNC``'s own return
+    type), and forcing that cast onto a ``TIMESTAMP_TRUNC`` /
+    ``DATETIME_TRUNC`` call would both change its result type and
+    drop any time-zone argument. Those calls need no rewrite here —
+    DuckDB's own ``TIMESTAMP_TRUNC(..., 'WEEK')`` is already
+    Monday-start by default, the same as BigQuery's explicit
+    ``WEEK(MONDAY)``.
+
     BigQuery's *default* ``WEEK`` truncation is Sunday-start;
     ``MONDAY`` must be named explicitly to opt into Monday-start.
     SQLGlot's BigQuery generator drops a bare/``WEEK(SUNDAY)`` day
@@ -274,11 +284,11 @@ def _rewrite_date_trunc_week_monday(tree: exp.Expression) -> bool:
     so the cross-dialect transpile of a round-trip-collapsed
     default/Sunday call and an untouched ``WEEK(MONDAY)`` call land on
     the exact same DuckDB shape: ``TimestampTrunc(this=x, unit='WEEK')``.
-    By that point, :class:`bqemulator.sql.rules.iso_date_parts.DateTruncWeekRule`
+    At that point, :class:`bqemulator.sql.rules.iso_date_parts.DateTruncWeekRule`
     — the safety net that adds the Sunday-start day math BigQuery's
-    *default* WEEK needs over a schema-typed DATE column — can no
-    longer tell the two apart, and mis-applies its Sunday shift to a
-    genuine ``WEEK(MONDAY)`` call too.
+    *default* WEEK needs over a schema-typed DATE column — cannot tell
+    the two apart, and would apply its Sunday shift to a genuine
+    ``WEEK(MONDAY)`` call too.
 
     Rewriting the explicit MONDAY form here, on the original BigQuery
     AST where the day-of-week is still an unambiguous ``exp.WeekStart``
@@ -287,7 +297,7 @@ def _rewrite_date_trunc_week_monday(tree: exp.Expression) -> bool:
     ``DATE_TRUNC`` call left for ``DateTruncWeekRule`` to (mis)match.
     """
     modified = False
-    for node in list(tree.find_all(exp.DateTrunc, exp.TimestampTrunc)):
+    for node in list(tree.find_all(exp.DateTrunc)):
         unit = node.args.get("unit")
         if not isinstance(unit, exp.WeekStart):
             continue
