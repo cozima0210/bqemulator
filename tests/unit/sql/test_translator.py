@@ -241,15 +241,19 @@ class TestGroupByAliasOrdinalRewrite:
         self,
         translator: SQLTranslator,
     ) -> None:
-        """A quoted GROUP BY identifier keeps case-sensitive matching.
+        """A backtick-quoted GROUP BY identifier keeps case-sensitive matching.
 
-        Guards against the case-insensitive fold over-firing: quoting
-        opts an identifier out of the fold, so ``GROUP BY "Project_ID"``
-        (quoted, exact case) must not be confused with an unquoted
-        alias of a different case.
+        BigQuery quotes identifiers with backticks (double quotes are
+        a string literal, not an identifier — ``GROUP BY "x"`` groups
+        by a constant, which is a different, degenerate case this
+        rewrite never touches since it isn't a column reference at
+        all). Guards against the case-insensitive fold over-firing:
+        quoting opts an identifier out of the fold, so a
+        backtick-quoted, exact-case ``GROUP BY`` item must not be
+        confused with an unquoted alias of a different case.
         """
         result = translator.translate(
-            'SELECT a AS project_id FROM t GROUP BY "Project_ID"',
+            "SELECT a AS project_id FROM t GROUP BY `Project_ID`",
         )
         assert isinstance(result, Ok)
         assert "GROUP BY 1" not in result.value
@@ -260,15 +264,15 @@ class TestGroupByAliasOrdinalRewrite:
     ) -> None:
         """A quoted alias and an unquoted GROUP BY item never match.
 
-        Guards against folding both to the same lookup key: a quoted
-        ``AS "foo"`` alias and an unquoted ``GROUP BY foo`` happen to
-        share a spelling here, but quoted and unquoted identifiers are
-        different namespaces and must never be confused for each
+        Guards against folding both to the same lookup key: a
+        backtick-quoted alias and an unquoted ``GROUP BY`` item happen
+        to share a spelling here, but quoted and unquoted identifiers
+        are different namespaces and must never be confused for each
         other, even when case-folding would otherwise make their keys
         collide.
         """
         result = translator.translate(
-            'SELECT a AS "foo" FROM t GROUP BY foo',
+            "SELECT a AS `foo` FROM t GROUP BY foo",
         )
         assert isinstance(result, Ok)
         assert "GROUP BY 1" not in result.value
@@ -285,7 +289,7 @@ class TestGroupByAliasOrdinalRewrite:
         unquoted alias's ordinal, not get flagged ambiguous.
         """
         result = translator.translate(
-            'SELECT a AS "foo", b AS foo FROM t GROUP BY foo',
+            "SELECT a AS `foo`, b AS foo FROM t GROUP BY foo",
         )
         assert isinstance(result, Ok)
         assert "GROUP BY 2" in result.value
