@@ -254,6 +254,42 @@ class TestGroupByAliasOrdinalRewrite:
         assert isinstance(result, Ok)
         assert "GROUP BY 1" not in result.value
 
+    def test_quoted_alias_does_not_match_unquoted_group_by_of_same_spelling(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A quoted alias and an unquoted GROUP BY item never match.
+
+        Guards against folding both to the same lookup key: a quoted
+        ``AS "foo"`` alias and an unquoted ``GROUP BY foo`` happen to
+        share a spelling here, but quoted and unquoted identifiers are
+        different namespaces and must never be confused for each
+        other, even when case-folding would otherwise make their keys
+        collide.
+        """
+        result = translator.translate(
+            'SELECT a AS "foo" FROM t GROUP BY foo',
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY 1" not in result.value
+
+    def test_quoted_and_unquoted_aliases_of_same_spelling_are_not_ambiguous(
+        self,
+        translator: SQLTranslator,
+    ) -> None:
+        """A quoted and an unquoted alias of the same spelling are distinct.
+
+        They occupy different namespaces (BigQuery's quoting rule), so
+        having both in the same SELECT list is not the duplicate-alias
+        case — an unquoted GROUP BY reference must resolve to the
+        unquoted alias's ordinal, not get flagged ambiguous.
+        """
+        result = translator.translate(
+            'SELECT a AS "foo", b AS foo FROM t GROUP BY foo',
+        )
+        assert isinstance(result, Ok)
+        assert "GROUP BY 2" in result.value
+
     def test_group_by_referencing_duplicated_alias_is_ambiguous(
         self,
         translator: SQLTranslator,
@@ -263,15 +299,18 @@ class TestGroupByAliasOrdinalRewrite:
         GoogleSQL permits a SELECT list to reuse the same output alias
         as long as it is never referenced elsewhere in the query; a
         ``GROUP BY`` item that does reference it is ambiguous and must
-        be rejected rather than silently resolved to whichever
-        projection happened to be assigned to the alias last.
+        be rejected — as a clean ``Err``, matching every other
+        semantic-analysis failure ``translate()`` reports — rather
+        than silently resolved to whichever projection happened to be
+        assigned to the alias last.
         """
         from bqemulator.domain.errors import InvalidQueryError
 
-        with pytest.raises(InvalidQueryError):
-            translator.translate(
-                "SELECT COUNT(*) AS key, category AS key FROM t GROUP BY key",
-            )
+        result = translator.translate(
+            "SELECT COUNT(*) AS key, category AS key FROM t GROUP BY key",
+        )
+        assert isinstance(result, Err)
+        assert isinstance(result.error, InvalidQueryError)
 
     def test_group_by_ignores_unreferenced_duplicated_alias(
         self,
