@@ -195,12 +195,16 @@ class TestDateTruncWeekMonday:
     ``DATE_TRUNC('WEEK', x)`` is *also* Monday-start, so the
     cross-dialect transpile of a round-trip-collapsed default/Sunday
     call and an untouched ``WEEK(MONDAY)`` call land on the exact same
-    DuckDB shape. Without this rewrite,
-    ``bqemulator.sql.rules.iso_date_parts.DateTruncWeekRule`` — the
+    DuckDB shape — indistinguishable, at that point, to
+    ``bqemulator.sql.rules.iso_date_parts.DateTruncWeekRule`` (the
     safety net that adds the Sunday-start day math BigQuery's
-    *default* WEEK needs over a schema-typed DATE column — can no
-    longer tell the two apart, and mis-applies its Sunday shift to a
-    genuine ``WEEK(MONDAY)`` call too.
+    *default* WEEK needs over a schema-typed DATE column). This
+    rewrite removes ``WEEK(MONDAY)`` before the round-trip can
+    collapse the ambiguity into that shape, so ``DateTruncWeekRule``
+    never sees a genuine ``WEEK(MONDAY)`` call to (mis)match. Only
+    ``DATE_TRUNC`` is a candidate — ``TIMESTAMP_TRUNC`` /
+    ``DATETIME_TRUNC`` need no such rewrite; see
+    ``_rewrite_date_trunc_week_monday``'s own docstring.
     """
 
     def test_tuesday_returns_previous_monday(
@@ -229,16 +233,13 @@ class TestDateTruncWeekMonday:
     def test_survives_date_add_round_trip_in_same_query(
         self, t: SQLTranslator, con: duckdb.DuckDBPyConnection
     ) -> None:
-        """Regression: a co-occurring ``DATE_ADD`` must not corrupt WEEK(MONDAY).
+        """A co-occurring ``DATE_ADD`` in the same query must not corrupt WEEK(MONDAY).
 
-        Before this rewrite, the presence of ``DATE_ADD`` anywhere in
-        the query forced a BigQuery-text round-trip that silently
-        collapsed ``WEEK(SUNDAY)`` to the ambiguous bare ``WEEK`` form
-        elsewhere in the *same* query — and, once
-        ``DateTruncWeekRule`` also recognizes schema-typed columns,
-        that ambiguity made a genuine ``WEEK(MONDAY)`` call
-        indistinguishable from the collapsed default and get the
-        Sunday shift applied to it too.
+        ``DATE_ADD`` anywhere in the query forces a BigQuery-text
+        round-trip that collapses a co-occurring ``WEEK(SUNDAY)`` to
+        the ambiguous bare ``WEEK`` form; this rewrite removes
+        ``WEEK(MONDAY)`` before that round-trip can make it
+        indistinguishable from the collapsed default.
         """
         row = _execute(
             t,
@@ -259,6 +260,24 @@ class TestDateTruncWeekMonday:
             "DATE_TRUNC(DATE '2026-09-15', WEEK(SUNDAY)) AS sunday_start",
         )
         assert row == (_dt.date(2026, 9, 14), _dt.date(2026, 9, 13))
+
+    def test_timestamp_trunc_week_monday_is_not_rewritten(self) -> None:
+        """``TIMESTAMP_TRUNC(x, WEEK(MONDAY))`` is left untouched by this pass.
+
+        This rewrite's output is always cast to ``DATE`` — the return
+        type ``DATE_TRUNC`` needs. Applying that same cast to a
+        ``TIMESTAMP_TRUNC`` call would silently change its result type
+        (and drop any time-zone argument), so only ``exp.DateTrunc`` is
+        a candidate; ``TIMESTAMP_TRUNC`` / ``DATETIME_TRUNC`` calls pass
+        through this module unchanged.
+        """
+        sql = "SELECT TIMESTAMP_TRUNC(ts, WEEK(MONDAY)) AS ts FROM t"
+        assert rewrite_datetime_helpers(sql) == sql
+
+    def test_datetime_trunc_week_monday_is_not_rewritten(self) -> None:
+        """Same guarantee as above, for ``DATETIME_TRUNC``."""
+        sql = "SELECT DATETIME_TRUNC(dt, WEEK(MONDAY)) AS dt FROM t"
+        assert rewrite_datetime_helpers(sql) == sql
 
 
 class TestParseFailureTolerance:
