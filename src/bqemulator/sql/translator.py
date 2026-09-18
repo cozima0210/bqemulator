@@ -431,6 +431,16 @@ class SQLTranslator:
         matches one of that SELECT's output aliases with a 1-based
         ordinal literal pointing at that SELECT-list position. Returns
         ``True`` if any replacement was made.
+
+        Alias matching is case-insensitive for unquoted identifiers
+        (BigQuery's own resolution rule) and case-sensitive for quoted
+        ones; an unquoted and a quoted identifier never match each
+        other. When two SELECT-list aliases collide under this rule,
+        BigQuery's own semantics permit the duplication as long as
+        nothing references it — only a ``GROUP BY`` item that actually
+        names the colliding alias is an error, raised here as
+        :class:`InvalidQueryError` rather than silently resolved to
+        whichever projection happened to be assigned last.
         """
         modified = False
         for select in tree.find_all(exp.Select):
@@ -438,19 +448,33 @@ class SQLTranslator:
             if group is None:
                 continue
             alias_positions: dict[str, int] = {}
+            ambiguous_keys: set[str] = set()
             for idx, projection in enumerate(select.expressions, start=1):
-                alias = projection.alias if isinstance(projection, exp.Alias) else None
-                if alias:
-                    alias_positions[alias] = idx
+                if not isinstance(projection, exp.Alias):
+                    continue
+                alias_id = projection.args["alias"]
+                key = alias_id.name if alias_id.args.get("quoted") else alias_id.name.lower()
+                if key in alias_positions:
+                    ambiguous_keys.add(key)
+                else:
+                    alias_positions[key] = idx
             if not alias_positions:
                 continue
             new_expressions = []
             for item in group.expressions:
-                position = (
-                    alias_positions.get(item.name)
-                    if isinstance(item, exp.Column) and not item.table
-                    else None
-                )
+                key = None
+                if (
+                    isinstance(item, exp.Column)
+                    and not item.table
+                    and isinstance(item.this, exp.Identifier)
+                ):
+                    key = item.name if item.this.args.get("quoted") else item.name.lower()
+                if key is not None and key in ambiguous_keys:
+                    raise InvalidQueryError(
+                        f"Column name {item.name} is ambiguous",
+                        location="query",
+                    )
+                position = alias_positions.get(key) if key is not None else None
                 if position is None:
                     new_expressions.append(item)
                 else:
